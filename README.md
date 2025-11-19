@@ -1,0 +1,1 @@
+CRUD completo Redis + PostgreSQL em Python.
