@@ -1,154 +1,171 @@
-import os, json
 import psycopg2
-from psycopg2.extras import RealDictCursor
-import redis
-from dotenv import load_dotenv
-from tabulate import tabulate
+import xml.etree.ElementTree as ET
 
-# Carrega variáveis do .env
-load_dotenv()
-
-PG = {
-    "host": os.getenv("PGHOST", "localhost"),
-    "port": os.getenv("PGPORT", "5432"),
-    "user": os.getenv("PGUSER", "postgres"),
-    "password": os.getenv("PGPASSWORD", "postgres"),
-    "dbname": os.getenv("PGDATABASE", "demo_db"),
+# ==========================
+# CONFIG DO POSTGRES
+# ==========================
+DB_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "trabalho_xml",
+    "user": "postgres",
+    "password": "postgres"
 }
 
-# URL do Redis com valor padrão
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+def get_connection():
+    """
+    Abre conexão com o PostgreSQL usando a config acima.
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    # Se der problema de acentuação, isso ajuda:
+    conn.set_client_encoding("UTF8")
+    return conn
 
 
-def pg_conn():
-    return psycopg2.connect(**PG)
+# ==========================
+# CARREGAR DADOS DO POSTGRES
+# ==========================
+def carregar_dados_relacionais():
+    """
+    Lê Fornecedor, Peca e Projeto do banco e guarda em dicionários.
+    As chaves vão ser F1, P1, J1 para casar DIRETO com o XML.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    # ---------- Fornecedor ----------
+    cur.execute("SELECT cod_fornec, fnome, status, cidade FROM Fornecedor;")
+    fornecedores = {}
+    for cod, nome, status, cidade in cur.fetchall():
+        # cod é numeric, convertemos pra int e montamos F1, F2, ...
+        chave = f"F{int(cod)}"
+        fornecedores[chave] = {
+            "codigo": int(cod),
+            "nome": nome,
+            "status": int(status) if status is not None else None,
+            "cidade": cidade,
+        }
+
+    # ---------- Peca ----------
+    cur.execute("SELECT cod_peca, pnome, cor, peso, cdade FROM Peca;")
+    pecas = {}
+    for cod, nome, cor, peso, cdade in cur.fetchall():
+        chave = f"P{int(cod)}"
+        pecas[chave] = {
+            "codigo": int(cod),
+            "nome": nome,
+            "cor": cor,
+            "peso": float(peso) if peso is not None else None,
+            "cidade": cdade,
+        }
+
+    # ---------- Projeto ----------
+    cur.execute("SELECT cod_proj, jnome, cidade FROM Projeto;")
+    projetos = {}
+    for cod, nome, cidade in cur.fetchall():
+        chave = f"J{int(cod)}"
+        projetos[chave] = {
+            "codigo": int(cod),
+            "nome": nome,
+            "cidade": cidade,
+        }
+
+    cur.close()
+    conn.close()
+    return fornecedores, pecas, projetos
 
 
-def redis_conn():
-    return redis.from_url(REDIS_URL, decode_responses=True)
+# ==========================
+# CARREGAR FORNECIMENTOS DO XML
+# ==========================
+def carregar_fornecimentos_xml(caminho_xml: str):
+    """
+    Lê o arquivo fornecimento.xml no formato:
+
+    <dados>
+      <fornecimento>
+        <Cod_Fornec>F1</Cod_Fornec>
+        <Cod_Peca>P1</Cod_Peca>
+        <Cod_Proj>J1</Cod_Proj>
+        <Quantidade>200</Quantidade>
+      </fornecimento>
+      ...
+    </dados>
+    """
+    tree = ET.parse(caminho_xml)
+    root = tree.getroot()
+
+    fornecimentos = []
+    for f in root.findall("fornecimento"):
+        cod_fornec = f.findtext("Cod_Fornec")
+        cod_peca = f.findtext("Cod_Peca")
+        cod_proj = f.findtext("Cod_Proj")
+        qtd_text = f.findtext("Quantidade")
+
+        quantidade = int(qtd_text) if qtd_text is not None else 0
+
+        fornecimentos.append({
+            "cod_fornec": cod_fornec,   # ex: F1
+            "cod_peca": cod_peca,       # ex: P1
+            "cod_proj": cod_proj,       # ex: J1
+            "quantidade": quantidade,
+        })
+
+    return fornecimentos
 
 
-def ensure():
-    # Cria a tabela se não existir
-    sql = open("db.sql").read()
-    with pg_conn() as c:
-        with c.cursor() as cur:
-            cur.execute(sql)
-        c.commit()
+# ==========================
+# GERAR RELATÓRIO INTEGRADO
+# ==========================
+def gerar_relatorio(fornecedores, pecas, projetos, fornecimentos):
+    """
+    Para cada fornecimento do XML, faz a junção com os dados do Postgres.
+    Só imprime quando fornecedor, peça e projeto existem no banco.
+    """
+    print("=== RELATÓRIO INTEGRANDO XML + POSTGRES ===\n")
+    print(f"Total de fornecimentos no XML: {len(fornecimentos)}\n")
 
+    for f in fornecimentos:
+        cod_fornec_xml = f["cod_fornec"]  # F1, F2...
+        cod_peca_xml = f["cod_peca"]      # P1, P2...
+        cod_proj_xml = f["cod_proj"]      # J1, J2...
+        qtd = f["quantidade"]
 
-def cache_key(i):
-    return f"student:{i}"
+        # Se qualquer um não existir no banco, pula
+        if cod_fornec_xml not in fornecedores:
+            print(f"[IGNORADO] Fornecedor {cod_fornec_xml} não existe no banco.")
+            continue
 
+        if cod_peca_xml not in pecas:
+            print(f"[IGNORADO] Peça {cod_peca_xml} não existe no banco.")
+            continue
 
-def create_student(n, e, c):
-    sql = "INSERT INTO students (name,email,course) VALUES (%s,%s,%s) RETURNING *;"
-    with pg_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, (n, e, c))
-            row = cur.fetchone()
-            conn.commit()
-    # aqui usamos default=str para converter datetime em string
-    r = redis_conn()
-    r.set(cache_key(row["id"]), json.dumps(row, default=str))
-    return row
+        if cod_proj_xml not in projetos:
+            print(f"[IGNORADO] Projeto {cod_proj_xml} não existe no banco.")
+            continue
 
+        forn = fornecedores[cod_fornec_xml]
+        peca = pecas[cod_peca_xml]
+        proj = projetos[cod_proj_xml]
 
-def read_student(i):
-    r = redis_conn()
-    k = cache_key(i)
-    cached = r.get(k)
-    if cached:
-        return json.loads(cached)
-
-    sql = "SELECT * FROM students WHERE id=%s;"
-    with pg_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, (i,))
-            row = cur.fetchone()
-
-    if row:
-        r.set(k, json.dumps(row, default=str))
-    return row
-
-
-def update_student(i, n=None, e=None, c=None):
-    fields = []
-    vals = []
-    if n:
-        fields.append("name=%s")
-        vals.append(n)
-    if e:
-        fields.append("email=%s")
-        vals.append(e)
-    if c:
-        fields.append("course=%s")
-        vals.append(c)
-
-    if not fields:
-        # nada pra atualizar, só retorna o aluno
-        return read_student(i)
-
-    vals.append(i)
-    sql = f"UPDATE students SET {','.join(fields)} WHERE id=%s RETURNING *;"
-    with pg_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, vals)
-            row = cur.fetchone()
-            conn.commit()
-
-    r = redis_conn()
-    if row:
-        r.set(cache_key(i), json.dumps(row, default=str))
-    return row
-
-
-def delete_student(i):
-    sql = "DELETE FROM students WHERE id=%s;"
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (i,))
-            ok = cur.rowcount > 0
-            conn.commit()
-    r = redis_conn()
-    r.delete(cache_key(i))
-    return ok
-
-
-def list_students():
-    sql = "SELECT * FROM students ORDER BY id;"
-    with pg_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql)
-            return cur.fetchall()
+        print(
+            f"Fornecedor {cod_fornec_xml} ({forn['nome']}, {forn['cidade']}) "
+            f"forneceu {qtd} unidades da peça {cod_peca_xml} "
+            f"({peca['nome']}, {peca['cor']}) "
+            f"para o projeto {cod_proj_xml} ({proj['nome']}, {proj['cidade']})."
+        )
 
 
 def main():
-    ensure()
-    while True:
-        print("\n1-Create 2-Read 3-Update 4-Delete 5-List 0-Exit")
-        c = input("» ")
-        if c == '1':
-            n = input("Name: ")
-            e = input("Email: ")
-            co = input("Course: ")
-            print(create_student(n, e, co))
-        elif c == '2':
-            i = int(input("ID: "))
-            print(read_student(i))
-        elif c == '3':
-            i = int(input("ID: "))
-            n = input("Name: ") or None
-            e = input("Email: ") or None
-            co = input("Course: ") or None
-            print(update_student(i, n, e, co))
-        elif c == '4':
-            i = int(input("ID: "))
-            print(delete_student(i))
-        elif c == '5':
-            print(tabulate(list_students(), headers="keys", tablefmt="grid"))
-        elif c == '0':
-            break
+    # 1) Carrega dados relacionais (Postgres)
+    fornecedores, pecas, projetos = carregar_dados_relacionais()
+
+    # 2) Carrega fornecimentos do XML
+    # Certifique-se que "fornecimento.xml" está na MESMA PASTA do app.py
+    fornecimentos = carregar_fornecimentos_xml("fornecimento.xml")
+
+    # 3) Gera a junção / integração
+    gerar_relatorio(fornecedores, pecas, projetos, fornecimentos)
 
 
 if __name__ == "__main__":
